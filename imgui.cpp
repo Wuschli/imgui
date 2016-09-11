@@ -2886,6 +2886,7 @@ void ImGui::RenderTextClipped(const ImVec2& pos_min, const ImVec2& pos_max, cons
     if (align & ImGuiAlign_Center) pos.x = ImMax(pos.x, (pos.x + pos_max.x - text_size.x) * 0.5f);
     else if (align & ImGuiAlign_Right) pos.x = ImMax(pos.x, pos_max.x - text_size.x);
     if (align & ImGuiAlign_VCenter) pos.y = ImMax(pos.y, (pos.y + pos_max.y - text_size.y) * 0.5f);
+    else if (align & ImGuiAlign_Bottom) pos.y = ImMax(pos.y, pos_max.y - text_size.y);
 
     // Render
     if (need_clipping)
@@ -6742,6 +6743,172 @@ bool ImGui::SliderInt4(const char* label, int v[4], int v_min, int v_max, const 
     return SliderIntN(label, v, 4, v_min, v_max, display_format);
 }
 
+bool ImGui::KnobBehavior(const ImRect& frame_bb, ImGuiID id, float* v, float v_speed, float v_min, float v_max, float power, int decimal_precision)
+{
+  ImGuiContext& g = *GImGui;
+  ImGuiWindow* window = GetCurrentWindow();
+  const ImGuiStyle& style = g.Style;
+  
+  float radius = ImMin(frame_bb.GetWidth(), frame_bb.GetHeight()) / 2;
+  
+  // Draw frame
+  window->DrawList->AddCircleFilled(frame_bb.GetCenter(), radius, GetColorU32(ImGuiCol_FrameBg), 24);
+  
+  const bool is_non_linear = fabsf(power - 1.0f) > 0.0001f;
+  
+  // For logarithmic sliders that cross over sign boundary we want the exponential increase to be symmetric around 0.0f
+  float linear_zero_pos = 0.0f;   // 0.0->1.0f
+  if (v_min * v_max < 0.0f)
+  {
+    // Different sign
+    const float linear_dist_min_to_0 = powf(fabsf(0.0f - v_min), 1.0f/power);
+    const float linear_dist_max_to_0 = powf(fabsf(v_max - 0.0f), 1.0f/power);
+    linear_zero_pos = linear_dist_min_to_0 / (linear_dist_min_to_0+linear_dist_max_to_0);
+  }
+  else
+  {
+    // Same sign
+    linear_zero_pos = v_min < 0.0f ? 1.0f : 0.0f;
+  }
+  
+  bool value_changed = false;
+  
+  // Process clicking on the drag
+  if (g.ActiveId == id)
+  {
+    if (g.IO.MouseDown[0])
+    {
+      if (g.ActiveIdIsJustActivated)
+      {
+        // Lock current value on click
+        g.DragCurrentValue = *v;
+        g.DragLastMouseDelta = ImVec2(0.f, 0.f);
+      }
+      
+      float v_cur = g.DragCurrentValue;
+      const ImVec2 mouse_drag_delta = GetMouseDragDelta(0, 1.0f);
+      if (fabsf(mouse_drag_delta.y - g.DragLastMouseDelta.y) > 0.0f)
+      {
+        float speed = v_speed;
+        if (speed == 0.0f && (v_max - v_min) != 0.0f && (v_max - v_min) < FLT_MAX)
+          speed = (v_max - v_min) * g.DragSpeedDefaultRatio;
+        if (g.IO.KeyShift && g.DragSpeedScaleFast >= 0.0f)
+          speed = speed * g.DragSpeedScaleFast;
+        if (g.IO.KeyAlt && g.DragSpeedScaleSlow >= 0.0f)
+          speed = speed * g.DragSpeedScaleSlow;
+        
+        float delta = (mouse_drag_delta.y - g.DragLastMouseDelta.y) * speed;
+        if (is_non_linear)
+        {
+          // Logarithmic curve on both side of 0.0
+          float v0_abs = v_cur >= 0.0f ? v_cur : -v_cur;
+          float v0_sign = v_cur >= 0.0f ? 1.0f : -1.0f;
+          float v1 = powf(v0_abs, 1.0f / power) + (delta * v0_sign);
+          float v1_abs = v1 >= 0.0f ? v1 : -v1;
+          float v1_sign = v1 >= 0.0f ? 1.0f : -1.0f;          // Crossed sign line
+          v_cur = powf(v1_abs, power) * v0_sign * v1_sign;    // Reapply sign
+        }
+        else
+        {
+          v_cur += delta;
+        }
+        g.DragLastMouseDelta.y = mouse_drag_delta.y;
+        
+        // Clamp
+        if (v_min < v_max)
+          v_cur = ImClamp(v_cur, v_min, v_max);
+        g.DragCurrentValue = v_cur;
+      }
+      
+      // Round to user desired precision, then apply
+      v_cur = RoundScalar(v_cur, decimal_precision);
+      if (*v != v_cur)
+      {
+        *v = v_cur;
+        value_changed = true;
+      }
+    }
+    else
+    {
+      SetActiveID(0, NULL);
+    }
+  }
+  
+  // Calculate slider grab positioning
+  float grab_t;
+  if (is_non_linear)
+  {
+    float v_clamped = ImClamp(*v, v_min, v_max);
+    if (v_clamped < 0.0f)
+    {
+      const float f = 1.0f - (v_clamped - v_min) / (ImMin(0.0f,v_max) - v_min);
+      grab_t = (1.0f - powf(f, 1.0f/power)) * linear_zero_pos;
+    }
+    else
+    {
+      const float f = (v_clamped - ImMax(0.0f,v_min)) / (v_max - ImMax(0.0f,v_min));
+      grab_t = linear_zero_pos + powf(f, 1.0f/power) * (1.0f - linear_zero_pos);
+    }
+  }
+  else
+  {
+    // Linear slider
+    grab_t = (ImClamp(*v, v_min, v_max) - v_min) / (v_max - v_min);
+  }
+  
+  // Draw
+  ImVec2 center = frame_bb.GetCenter();
+  window->DrawList->AddLine(center, ImVec2(center.x + radius * cos(-grab_t * 1.6f * IM_PI + 0.3f * IM_PI), center.y + radius * sin(-grab_t * 1.6f * IM_PI + 0.3f * IM_PI)), GetColorU32(g.ActiveId == id ? ImGuiCol_SliderGrabActive : ImGuiCol_SliderGrab));
+  
+  return value_changed;
+}
+
+bool ImGui::KnobFloat(const char* label, const ImVec2& size, float* v, float v_speed, float v_min, float v_max, const char* display_format, float power)
+{
+  ImGuiWindow* window = GetCurrentWindow();
+  if (window->SkipItems)
+    return false;
+  
+  ImGuiContext& g = *GImGui;
+  const ImGuiStyle& style = g.Style;
+  const ImGuiID id = window->GetID(label);
+  
+  const ImVec2 label_size = CalcTextSize(label, NULL, true);
+  const ImRect frame_bb(window->DC.CursorPos, window->DC.CursorPos + size);
+  const ImRect bb(frame_bb.Min, frame_bb.Max + ImVec2(label_size.x > 0.0f ? style.ItemInnerSpacing.x + label_size.x : 0.0f, 0.0f));
+  
+  ItemSize(bb, style.FramePadding.y);
+  if (!ItemAdd(frame_bb, &id))
+    return false;
+  
+  const bool hovered = IsHovered(frame_bb, id);
+  if (hovered)
+    SetHoveredID(id);
+  
+  if (!display_format)
+    display_format = "%.3f";
+  int decimal_precision = ParseFormatPrecision(display_format, 3);
+  
+  if (hovered && g.IO.MouseClicked[0])
+  {
+    SetActiveID(id, window);
+    FocusWindow(window);
+  }
+  
+  // Actual slider behavior + render grab
+  bool value_changed = KnobBehavior(frame_bb, id, v, v_speed, v_min, v_max, power, decimal_precision);
+  
+  // Display value using user-provided display format so user can add prefix/suffix/decorations to the value.
+  // For the vertical slider we allow centered text to overlap the frame padding
+  char value_buf[64];
+  char* value_buf_end = value_buf + ImFormatString(value_buf, IM_ARRAYSIZE(value_buf), display_format, *v);
+  RenderTextClipped(ImVec2(frame_bb.Min.x, frame_bb.Min.y + style.FramePadding.y), frame_bb.Max, value_buf, value_buf_end, NULL, ImGuiAlign_Center);
+  if (label_size.x > 0.0f)
+    RenderText(ImVec2(frame_bb.Max.x + style.ItemInnerSpacing.x, frame_bb.Min.y + style.FramePadding.y), label);
+  
+  return value_changed;
+}
+
 bool ImGui::DragBehavior(const ImRect& frame_bb, ImGuiID id, float* v, float v_speed, float v_min, float v_max, int decimal_precision, float power)
 {
     ImGuiContext& g = *GImGui;
@@ -7200,6 +7367,42 @@ void ImGui::ProgressBar(float fraction, const ImVec2& size_arg, const char* over
     ImVec2 overlay_size = CalcTextSize(overlay, NULL);
     if (overlay_size.x > 0.0f)
         RenderTextClipped(ImVec2(ImClamp(fill_br.x + style.ItemSpacing.x, bb.Min.x, bb.Max.x - overlay_size.x - style.ItemInnerSpacing.x), bb.Min.y), bb.Max, overlay, NULL, &overlay_size, ImGuiAlign_Left|ImGuiAlign_VCenter, &bb.Min, &bb.Max);
+}
+
+// size_arg (for each axis) < 0.0f: align to end, 0.0f: auto, > 0.0f: specified size
+void ImGui::VProgressBar(float fraction, const ImVec2& size_arg, const char* overlay)
+{
+  ImGuiWindow* window = GetCurrentWindow();
+  if (window->SkipItems)
+    return;
+  
+  ImGuiContext& g = *GImGui;
+  const ImGuiStyle& style = g.Style;
+  
+  ImVec2 pos = window->DC.CursorPos;
+  ImRect bb(pos, pos + CalcItemSize(size_arg, CalcItemWidth(), g.FontSize + style.FramePadding.y*2.0f));
+  ItemSize(bb, style.FramePadding.y);
+  if (!ItemAdd(bb, NULL))
+    return;
+  
+  // Render
+  fraction = ImSaturate(fraction);
+  RenderFrame(bb.Min, bb.Max, GetColorU32(ImGuiCol_FrameBg), true, style.FrameRounding);
+  bb.Reduce(ImVec2(window->BorderSize, window->BorderSize));
+  const ImVec2 fill_br = ImVec2(bb.Min.x, ImLerp(bb.Max.y, bb.Min.y, fraction));
+  RenderFrame(fill_br, bb.Max, GetColorU32(ImGuiCol_PlotHistogram), false, style.FrameRounding);
+  
+  // Default displaying the fraction as percentage string, but user can override it
+  char overlay_buf[32];
+  if (!overlay)
+  {
+    ImFormatString(overlay_buf, IM_ARRAYSIZE(overlay_buf), "%.0f%%", fraction*100+0.01f);
+    overlay = overlay_buf;
+  }
+  
+  ImVec2 overlay_size = CalcTextSize(overlay, NULL);
+  if (overlay_size.y > 0.0f)
+    RenderTextClipped(bb.Min, ImVec2(bb.Max.x, ImClamp(fill_br.y - style.ItemSpacing.y, bb.Min.y + overlay_size.y - style.ItemInnerSpacing.y, bb.Max.y)), overlay, NULL, &overlay_size, ImGuiAlign_Center|ImGuiAlign_Bottom, &bb.Min, &bb.Max);
 }
 
 bool ImGui::Checkbox(const char* label, bool* v)
